@@ -50,9 +50,22 @@ _PY_TYPES: dict[DataType, tuple[type, ...]] = {
 _TEMPORAL = (DataType.DATE, DataType.TIMESTAMP)
 _NUMERIC = (DataType.INTEGER, DataType.NUMBER)
 
+# 契约级合法配置项白名单：出现此外的键一律按契约非法拒绝，
+# 不允许"写错了但被悄悄忽略"（如把 freshness_field 拼成 freshness_filed）。
+_CONTRACT_KEYS = {
+    "name",
+    "version",
+    "fields",
+    "freshness_field",
+    "freshness_max_age_seconds",
+    "drift_tolerance",
+}
+
 
 class FieldSpec(BaseModel):
     """单字段的统一约束模型。"""
+
+    model_config = {"extra": "forbid"}
 
     name: str
     type: DataType
@@ -67,6 +80,10 @@ class FieldSpec(BaseModel):
     regex: str | None = None
 
 
+# 字段级合法配置项白名单，直接取自 FieldSpec 定义，避免两处漂移。
+_FIELD_KEYS = set(FieldSpec.model_fields)
+
+
 class Contract(BaseModel):
     """一份数据契约。"""
 
@@ -76,6 +93,9 @@ class Contract(BaseModel):
     # 时间字段及其 SLA，供刷新时效指标使用。
     freshness_field: str | None = None
     freshness_max_age_seconds: float | None = None
+    # 漂移判定容忍幅度（允许指标较基线下滑的最大绝对值），
+    # 在批次首次判定时固化进漂移报告，之后修改不回写历史。
+    drift_tolerance: float = 0.0
 
     model_config = {"populate_by_name": True}
 
@@ -112,6 +132,15 @@ def normalize_contract(raw: dict[str, Any]) -> Contract:
             "契约 name 不能为空字符串", reason="contract_name_blank"
         )
 
+    unknown_top = sorted(set(raw) - _CONTRACT_KEYS)
+    if unknown_top:
+        raise ContractInvalidError(
+            f"契约 {name} 含未识别的契约级配置项 {unknown_top}，"
+            f"合法项为 {sorted(_CONTRACT_KEYS)}",
+            contract=name,
+            reason="contract_unknown_option",
+        )
+
     raw_fields = raw.get("fields")
     if not isinstance(raw_fields, list) or len(raw_fields) == 0:
         raise ContractInvalidError(
@@ -135,6 +164,15 @@ def normalize_contract(raw: dict[str, Any]) -> Contract:
                 f"契约 {name} 的第 {index} 个字段缺少有效 name",
                 contract=name,
                 reason="field_name_blank",
+            )
+        unknown_field_opts = sorted(set(rf) - _FIELD_KEYS)
+        if unknown_field_opts:
+            raise ContractInvalidError(
+                f"契约 {name} 的字段 {fname} 含未识别的字段级配置项 "
+                f"{unknown_field_opts}，合法项为 {sorted(_FIELD_KEYS)}",
+                contract=name,
+                field=fname,
+                reason="field_unknown_option",
             )
         if fname in seen:
             # 同名重复 = 对同一字段给出了两套互相冲突的定义。
@@ -208,12 +246,29 @@ def normalize_contract(raw: dict[str, Any]) -> Contract:
                 reason="freshness_field_missing",
             )
 
+    drift_tolerance = raw.get("drift_tolerance", 0.0)
+    if isinstance(drift_tolerance, bool) or not isinstance(
+        drift_tolerance, (int, float)
+    ):
+        raise ContractInvalidError(
+            "drift_tolerance 必须是 [0, 1] 内的数值",
+            contract=name,
+            reason="drift_tolerance_invalid",
+        )
+    if not 0.0 <= drift_tolerance <= 1.0:
+        raise ContractInvalidError(
+            f"drift_tolerance {drift_tolerance} 超出 [0, 1] 范围",
+            contract=name,
+            reason="drift_tolerance_out_of_range",
+        )
+
     try:
         return Contract(
             name=name,
             fields=specs,
             freshness_field=freshness_field,
             freshness_max_age_seconds=freshness_max,
+            drift_tolerance=drift_tolerance,
         )
     except ValidationError as exc:  # pragma: no cover - 兜底，理论不可达
         raise ContractInvalidError(

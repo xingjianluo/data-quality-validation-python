@@ -8,17 +8,19 @@ from __future__ import annotations
 
 from threading import Lock
 
+from app.quality.drift import DriftReport
 from app.quality.engine import ValidationResult
 from app.quality.metrics import MetricSnapshot
 
 
 class HistoryStore:
-    """进程内留存：校验结果 + 指标快照。"""
+    """进程内留存：校验结果 + 指标快照 + 漂移判定报告。"""
 
     def __init__(self) -> None:
         self._lock = Lock()
         self._results: dict[tuple[str, str], ValidationResult] = {}
         self._metrics: dict[tuple[str, str], list[MetricSnapshot]] = {}
+        self._drift: dict[tuple[str, str], DriftReport] = {}
 
     @staticmethod
     def _key(contract: str, batch_id: str) -> tuple[str, str]:
@@ -59,6 +61,31 @@ class HistoryStore:
     def get_metrics(self, contract: str, batch_id: str) -> list[MetricSnapshot]:
         with self._lock:
             return list(self._metrics.get(self._key(contract, batch_id), []))
+
+    def save_drift_if_absent(
+        self, contract: str, batch_id: str, report: DriftReport
+    ) -> bool:
+        """漂移报告同样只在批次首次判定时写入一次，之后不可改写。"""
+
+        key = self._key(contract, batch_id)
+        with self._lock:
+            if key in self._drift:
+                return False
+            self._drift[key] = report
+            return True
+
+    def get_drift(self, contract: str, batch_id: str) -> DriftReport | None:
+        with self._lock:
+            return self._drift.get(self._key(contract, batch_id))
+
+    def latest_batch(self, contract: str) -> str | None:
+        """该契约最近一次判定的批次（按判定先后，非批次名排序）。"""
+
+        with self._lock:
+            for cname, batch_id in reversed(list(self._results)):
+                if cname == contract:
+                    return batch_id
+            return None
 
     def list_batches(self, contract: str) -> list[str]:
         with self._lock:

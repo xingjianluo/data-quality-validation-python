@@ -220,3 +220,62 @@ def test_valid_contract_normalizes(case):
     case.basis(([s.name for s in contract.fields_], contract.freshness_field))
     assert contract.get("id").unique is True
     assert contract.freshness_field == "ts"
+
+
+def test_reject_unknown_top_level_option(case):
+    raw = {
+        "name": "c",
+        "fields": [{"name": "id", "type": "integer"}],
+        # 拼错的契约级配置项，绝不能被悄悄放过。
+        "freshness_filed": "id",
+    }
+    case.input("raw", raw)
+    case.expect((ErrorCategory.CONTRACT_INVALID, "contract_unknown_option"))
+    err = reject(raw)
+    case.basis((err.category.value, err.reason, err.message))
+    assert isinstance(err, ContractInvalidError)
+    assert err.reason == "contract_unknown_option"
+    assert "freshness_filed" in err.message
+
+
+def test_reject_unknown_field_level_option(case):
+    raw = {
+        "name": "c",
+        "fields": [{"name": "id", "type": "integer", "minn_value": 1}],
+    }
+    case.input("raw", raw)
+    case.expect((ErrorCategory.CONTRACT_INVALID, "field_unknown_option"))
+    err = reject(raw)
+    case.basis((err.category.value, err.reason, err.field, err.message))
+    assert isinstance(err, ContractInvalidError)
+    assert err.reason == "field_unknown_option"
+    assert err.field == "id"
+    assert "minn_value" in err.message
+
+
+def test_reject_misspelled_constraint_name(case):
+    raw = {
+        "name": "c",
+        "fields": [{"name": "id", "type": "integer", "unqiue": True}],
+    }
+    case.input("raw", raw)
+    case.expect("约束名拼错(unqiue)按 field_unknown_option 拒绝")
+    err = reject(raw)
+    case.basis((err.reason, err.field, err.message))
+    assert err.reason == "field_unknown_option"
+    assert err.field == "id"
+    assert "unqiue" in err.message
+
+
+def test_reject_drift_tolerance_out_of_range(case):
+    raw = {
+        "name": "c",
+        "fields": [{"name": "id", "type": "integer"}],
+        "drift_tolerance": 1.5,
+    }
+    case.input("raw", raw)
+    case.expect("drift_tolerance_out_of_range")
+    err = reject(raw)
+    case.basis((err.category.value, err.reason))
+    assert err.category == ErrorCategory.CONTRACT_INVALID
+    assert err.reason == "drift_tolerance_out_of_range"

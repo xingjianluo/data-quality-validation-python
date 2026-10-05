@@ -21,7 +21,8 @@
     {"name": "ts",    "type": "timestamp"}
   ],
   "freshness_field": "ts",
-  "freshness_max_age_seconds": 3600
+  "freshness_max_age_seconds": 3600,
+  "drift_tolerance": 0.05
 }
 ```
 
@@ -47,7 +48,22 @@
 * 值为 `null`（或缺列）时，只有 `nullable=true` 才放行；
 * 必填字段缺列 / 禁止 null 却为 null：判 `DATA_MISSING_FIELD`。
 
-### 1.3 契约非法、冲突、字段缺失都不静默跳过
+### 1.3 严格配置项：不认识的键一律拒绝
+
+契约是手写的，配置项或约束名拼错不能被当成"没写"悄悄放过。注册时
+对**契约级**与**字段级**各维护一份白名单，出现白名单之外的键即按
+`CONTRACT_INVALID` 拒绝，并在消息中指明位置与合法项：
+
+* 契约级未知键（如把 `freshness_field` 拼成 `freshness_filed`）：
+  `reason=contract_unknown_option`；
+* 字段级未知键（如 `minn_value`、约束名拼错 `unqiue`）：
+  `reason=field_unknown_option`，错误携带出错字段名。
+
+契约级合法键：`name / version / fields / freshness_field /
+freshness_max_age_seconds / drift_tolerance`；字段级合法键即
+`FieldSpec` 的全部声明字段（见 `app/quality/contracts.py`）。
+
+### 1.4 契约非法、冲突、字段缺失都不静默跳过
 
 归一化是“全有或全无”：任何问题都抛出带 `category + reason` 的错误，
 不会返回部分可用契约，也不吞掉底层解析器（pydantic）的异常——其原始异常
@@ -88,40 +104,69 @@
 每个批次在**首次提交时**计算并冻结指标快照 `MetricSnapshot`：
 
 * **完整性 completeness** = 非空必填单元数 / (行数 × 必填字段数)；
+  契约**没有任何必填字段**时（如只做去重/时效观察的全可选表），不存在
+  可缺失的必填单元，完整性按定义记 **1.0**，`reason` 中写明
+  "契约无必填字段，完整性按定义记 1.0"，回溯可见，不会报错；
 * **唯一性 uniqueness** = 去重后非空键数 / 非空键总数（无键记 1.0）；
 * **新鲜度 freshness** = 年龄不超过 SLA 的行占比，健康阈值固定 1.0，
   逐行 SLA `max_age_seconds` 一并固化。
 
 每个快照固化 `value / threshold / healthy / evaluated_at / reason /
-max_age_seconds`。
+max_age_seconds / field`（`field` 为追加字段，标识指标针对的字段）。
 
-### 3.1 漂移与时效阈值变更不得篡改历史
+### 3.1 基线漂移判定：跟过去比
 
-阈值只在批次**首次判定**时读取并写入快照。之后重新注册同名契约的新版本
-（收紧/放宽 SLA、调整阈值）：
+同一契约跑过多个批次后，当前批次在**首次判定时**与基线批次做一次
+漂移对比，结论固化为 `DriftReport`：
 
-* 旧批次的快照保持原值、原阈值、原健康结论，不可回写；
-* 新批次按新阈值判定。
+* **基线选择**：默认取该契约此前**最近一次已判定**的批次
+  （`baseline_source=latest`）；调用方也可在提交时显式指定某个更早的
+  历史批次（`baseline_batch_id`，`baseline_source=explicit`）；
+  首个批次没有基线，记 `baseline_source=none`，各指标状态为
+  `no_baseline`，不判退步；
+* **判定幅度**：契约级 `drift_tolerance`（[0,1]，默认 0）为允许指标
+  较基线下滑的最大绝对值。`当前值 < 基线值 - tolerance` 判
+  `regressed`，否则 `ok`；基线缺少同口径指标（按 `metric+field` 对齐）
+  记 `no_baseline_metric`，不硬凑结论；
+* **拒绝硬凑**：显式指定的基线批次不存在或尚未判定时，提交被整体拒绝
+  （`METRIC_NOT_FOUND / baseline_not_evaluated`），该批次不留下任何
+  判定痕迹；
+* **结论可解释**：每项对比都记录 `baseline_batch_id / baseline_value /
+  current_value / tolerance / status / reason`，说清跟哪个批次比、
+  按什么幅度判、为什么算退步。
 
-因此“同一批次无论何时回溯，结论一致”。
+### 3.2 漂移与时效阈值变更不得篡改历史
 
-### 3.2 从指标回溯到契约、批次与触发原因
+阈值与漂移结论都只在批次**首次判定**时读取并写入。之后产生新批次、
+调整 `drift_tolerance`、或重新注册同名契约的新版本（收紧/放宽 SLA、
+调整阈值）：
+
+* 旧批次的快照与漂移报告保持原值、原基线、原幅度、原结论，不可回写；
+* 新批次按新阈值、新幅度判定。
+
+因此“同一批次无论何时回溯，结论、基线与幅度都一致”。
+
+### 3.3 从指标回溯到契约、批次与触发原因
 
 `GET /contracts/{name}/batches/{batch}/trace` 返回：
 
 * `contract` / `batch_id`：定位契约与执行批次；
 * `validation`：是否通过、行数、违规明细（含每条的判定依据 `rule/expected`）；
 * `metrics[]`：每个指标的 `value/threshold/healthy/reason/evaluated_at`，
-  异常可直接读到触发原因。
+  异常可直接读到触发原因；
+* `drift`（追加字段，老字段含义不变）：漂移结论，含
+  `baseline_batch_id / baseline_source / tolerance / regressed` 及逐项
+  `comparisons[]`。
 
 ## 4. 并发与重复执行的一致性
 
 幂等键为 `(contract, batch_id)`：
 
 * 提交先走无锁快路径查历史；未命中再进入该批次独占锁并 double-check；
-* 同一批次只有第一个线程真正执行校验并落库结果与指标；
-* 并发/重复提交者拿到的是**同一首次结论对象**，指标只累计一次；
-* 即使重复请求携带不同的数据体，也以首次批次结论为准（批次即幂等键）。
+* 同一批次只有第一个线程真正执行校验，并落库结果、指标与漂移报告；
+* 并发/重复提交者拿到的是**同一首次结论对象**，指标与漂移判定只累计
+  一次，重复提交即使携带不同的数据体或不同的 `baseline_batch_id`，
+  也以首次批次结论为准（批次即幂等键）。
 
 校验引擎本身是无副作用的纯计算，同输入重复执行结果严格相等。
 
@@ -129,9 +174,9 @@ max_age_seconds`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/contracts` | 注册/更新契约（非法即拒绝） |
-| POST | `/contracts/{name}/batches/{batch}/validate` | 幂等提交批次校验 |
-| GET | `/contracts/{name}/batches/{batch}/trace` | 指标与判定回溯 |
+| POST | `/contracts` | 注册/更新契约（非法即拒绝，含未知配置项） |
+| POST | `/contracts/{name}/batches/{batch}/validate` | 幂等提交批次校验；请求体可带 `baseline_batch_id` 显式指定漂移基线 |
+| GET | `/contracts/{name}/batches/{batch}/trace` | 指标、漂移结论与判定回溯 |
 | GET | `/contracts/{name}/history` | 契约全批次指标历史 |
 | GET | `/health` | 健康检查 |
 
@@ -145,12 +190,18 @@ python3 -m pytest -q -s
 uvicorn main:app --reload
 ```
 
-测试重点（共 30+ 用例）：
+测试重点（共 50+ 用例）：
 
-* `tests/test_contracts.py`：畸形契约、冲突约束、字段缺失的可区分拒绝；
+* `tests/test_contracts.py`：畸形契约、冲突约束、字段缺失、未知配置项
+  （契约级/字段级/约束名拼错）与非法 `drift_tolerance` 的可区分拒绝；
 * `tests/test_engine.py`：数据违规/缺失/依赖故障三类分离、可重复性；
 * `tests/test_metrics_and_concurrency.py`：16 线程并发与重复提交只落一次、
   指标不重复累计、阈值变更不篡改历史、trace 回溯；
+* `tests/test_drift.py`：基线漂移判定（最近基线/显式基线/容忍幅度）、
+  基线未判定的明确拒绝、历史漂移结论不被新批次/调幅度/重注册改写、
+  并发与重复提交不重复判定；
+* `tests/test_all_optional.py`：全可选字段契约正常出结论、完整性按定义
+  记 1.0 且依据可回溯、去重约束仍然生效；
 * `tests/test_api.py`：错误分类到 HTTP 状态码的映射与接口幂等。
 
 每个用例通过 `case` 夹具在日志中打印 `INPUT[...] / EXPECTED / BASIS /

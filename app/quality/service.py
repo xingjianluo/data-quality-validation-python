@@ -17,6 +17,7 @@ from threading import Lock
 from typing import Any
 
 from app.quality.contracts import Contract, normalize_contract
+from app.quality.drift import compare_with_baseline
 from app.quality.engine import ValidationEngine, ValidationResult
 from app.quality.errors import (
     ContractInvalidError,
@@ -73,8 +74,13 @@ class QualityService:
         rows: list[dict[str, Any]],
         *,
         now: datetime | None = None,
+        baseline_batch_id: str | None = None,
     ) -> ValidationResult:
-        """幂等提交：重复/并发批次返回首次结论，且不重复累计指标。"""
+        """幂等提交：重复/并发批次返回首次结论，且不重复累计指标。
+
+        漂移对比只在批次首次判定时执行一次并固化：
+        重复/并发提交直接返回首次结论，不会重新选择基线或重新判定。
+        """
 
         contract = self._get_contract(contract_name)
         evaluated_now = now or self._utcnow()
@@ -91,17 +97,67 @@ class QualityService:
             if existing is not None:
                 return existing
 
+            # 基线在首次判定前解析；显式指定的基线必须已判定，
+            # 否则明确拒绝，绝不硬凑一个对比结论。
+            baseline_id, baseline_source = self._resolve_baseline(
+                contract_name, batch_id, baseline_batch_id
+            )
+
             result = self._engine.validate(contract, rows, batch_id)
             # 结果与指标在同一临界区内落库；指标只在首次写入时累计。
             stored = self._store.save_result_if_absent(
                 contract_name, batch_id, result
             )
             if stored:
+                snapshots = self._evaluate(contract, batch_id, rows, evaluated_now)
                 self._store.append_metrics_if_absent(
-                    contract_name, batch_id,
-                    self._evaluate(contract, batch_id, rows, evaluated_now),
+                    contract_name, batch_id, snapshots
+                )
+                baseline_metrics = (
+                    self._store.get_metrics(contract_name, baseline_id)
+                    if baseline_id is not None
+                    else None
+                )
+                self._store.save_drift_if_absent(
+                    contract_name,
+                    batch_id,
+                    compare_with_baseline(
+                        contract=contract_name,
+                        batch_id=batch_id,
+                        current=snapshots,
+                        baseline_batch_id=baseline_id,
+                        baseline=baseline_metrics,
+                        baseline_source=baseline_source,
+                        tolerance=contract.drift_tolerance,
+                        evaluated_at=evaluated_now,
+                    ),
                 )
             return result
+
+    def _resolve_baseline(
+        self, contract_name: str, batch_id: str, explicit: str | None
+    ) -> tuple[str | None, str]:
+        """确定本次判定的基线批次及其来源。
+
+        显式指定的基线必须已存在且已判定，否则抛出带明确原因的
+        :class:`MetricNotFoundError`；未指定时取该契约最近一次判定的批次；
+        首个批次返回 ``(None, "none")``。
+        """
+
+        if explicit is not None:
+            if self._store.get_result(contract_name, explicit) is None:
+                raise MetricNotFoundError(
+                    f"指定的基线批次 {explicit} 在契约 {contract_name} 下"
+                    "不存在或尚未判定，无法作为漂移基线",
+                    contract=contract_name,
+                    batch=explicit,
+                    reason="baseline_not_evaluated",
+                )
+            return explicit, "explicit"
+        latest = self._store.latest_batch(contract_name)
+        if latest is None:
+            return None, "none"
+        return latest, "latest"
 
     def _evaluate(
         self,
@@ -166,6 +222,7 @@ class QualityService:
                 reason="batch_not_found",
             )
         snapshots = self._store.get_metrics(contract_name, batch_id)
+        drift = self._store.get_drift(contract_name, batch_id)
         return {
             "contract": contract_name,
             "batch_id": batch_id,
@@ -176,6 +233,8 @@ class QualityService:
                 "violations": [v.model_dump() for v in result.violations],
             },
             "metrics": [s.trace() for s in snapshots],
+            # 追加字段：首次判定时固化的漂移结论；老字段含义不变。
+            "drift": drift.trace() if drift is not None else None,
         }
 
     def history(self, contract_name: str) -> list[MetricSnapshot]:

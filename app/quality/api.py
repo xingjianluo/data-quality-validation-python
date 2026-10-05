@@ -35,6 +35,8 @@ _STATUS = {
 class SubmitRequest(BaseModel):
     rows: list[dict[str, Any]]
     batch_id: str
+    # 可选：显式指定漂移对比的基线批次；缺省取最近一次已判定批次。
+    baseline_batch_id: str | None = None
 
 
 def create_app(service: QualityService | None = None) -> FastAPI:
@@ -53,7 +55,10 @@ def create_app(service: QualityService | None = None) -> FastAPI:
 
     @app.post("/contracts/{name}/batches/{batch_id}/validate")
     def validate(name: str, batch_id: str, payload: SubmitRequest) -> dict[str, Any]:
-        result = svc.submit(name, batch_id, payload.rows)
+        result = svc.submit(
+            name, batch_id, payload.rows,
+            baseline_batch_id=payload.baseline_batch_id,
+        )
         return {
             "batch_id": result.batch_id,
             "contract": result.contract,

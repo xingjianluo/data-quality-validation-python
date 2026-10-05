@@ -37,6 +37,8 @@ class MetricSnapshot(BaseModel):
     reason: str
     # 新鲜度逐行 SLA（秒）；非新鲜度指标为 None。同样固化。
     max_age_seconds: float | None = None
+    # 指标针对的字段（如唯一性键）；契约级指标为 None。追加字段，向后兼容。
+    field: str | None = None
 
     def trace(self) -> dict[str, Any]:
         """回溯三元组：契约 + 批次 + 触发原因。"""
@@ -48,6 +50,7 @@ class MetricSnapshot(BaseModel):
             "threshold": self.threshold,
             "healthy": self.healthy,
             "max_age_seconds": self.max_age_seconds,
+            "field": self.field,
             "evaluated_at": self.evaluated_at.isoformat(),
             "reason": self.reason,
         }
@@ -62,6 +65,7 @@ def _snapshot(
     evaluated_at: datetime,
     reason: str,
     max_age_seconds: float | None = None,
+    field: str | None = None,
 ) -> MetricSnapshot:
     healthy = value >= threshold
     return MetricSnapshot(
@@ -74,6 +78,7 @@ def _snapshot(
         evaluated_at=evaluated_at,
         reason=reason if healthy else f"{reason}; 低于阈值 {threshold}",
         max_age_seconds=max_age_seconds,
+        field=field,
     )
 
 
@@ -85,14 +90,22 @@ def completeness(
     threshold: float,
     evaluated_at: datetime,
 ) -> MetricSnapshot:
-    """完整率 = 非缺失必填单元数 / (行数 * 必填字段数)。空批次记 0。"""
+    """完整率 = 非缺失必填单元数 / (行数 * 必填字段数)。空批次记 0。
+
+    契约没有任何必填字段时（如只做去重/时效观察的全可选表），
+    不存在"可缺失的必填单元"，完整性按定义记 1.0 并在 reason 中说明，
+    而不是报错或硬凑一个分母。
+    """
 
     if not required_fields:
-        raise DependencyFailureError(
-            "完整性指标缺少必填字段定义",
-            contract=contract,
-            batch=batch_id,
-            reason="completeness_no_fields",
+        return _snapshot(
+            MetricType.COMPLETENESS,
+            batch_id,
+            contract,
+            1.0,
+            threshold,
+            evaluated_at,
+            "契约无必填字段，完整性按定义记 1.0（0/0 无缺失可能）",
         )
     total = len(rows) * len(required_fields)
     present = 0
@@ -137,6 +150,7 @@ def uniqueness(
         threshold,
         evaluated_at,
         f"{distinct}/{total} 键唯一",
+        field=key_field,
     )
 
 
@@ -190,6 +204,7 @@ def freshness(
         evaluated_at,
         f"{fresh}/{total} 行在 SLA {max_age_seconds}s 内",
         max_age_seconds=max_age_seconds,
+        field=ts_field,
     )
 
 
