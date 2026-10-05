@@ -37,6 +37,9 @@ class MetricSnapshot(BaseModel):
     reason: str
     # 新鲜度逐行 SLA（秒）；非新鲜度指标为 None。同样固化。
     max_age_seconds: float | None = None
+    # 指标维度：完整性/新鲜度为 None；唯一性为被观察的字段名。
+    # 漂移对比据此配对同名指标。
+    dimension: str | None = None
 
     def trace(self) -> dict[str, Any]:
         """回溯三元组：契约 + 批次 + 触发原因。"""
@@ -48,6 +51,7 @@ class MetricSnapshot(BaseModel):
             "threshold": self.threshold,
             "healthy": self.healthy,
             "max_age_seconds": self.max_age_seconds,
+            "dimension": self.dimension,
             "evaluated_at": self.evaluated_at.isoformat(),
             "reason": self.reason,
         }
@@ -62,6 +66,7 @@ def _snapshot(
     evaluated_at: datetime,
     reason: str,
     max_age_seconds: float | None = None,
+    dimension: str | None = None,
 ) -> MetricSnapshot:
     healthy = value >= threshold
     return MetricSnapshot(
@@ -74,6 +79,7 @@ def _snapshot(
         evaluated_at=evaluated_at,
         reason=reason if healthy else f"{reason}; 低于阈值 {threshold}",
         max_age_seconds=max_age_seconds,
+        dimension=dimension,
     )
 
 
@@ -85,14 +91,22 @@ def completeness(
     threshold: float,
     evaluated_at: datetime,
 ) -> MetricSnapshot:
-    """完整率 = 非缺失必填单元数 / (行数 * 必填字段数)。空批次记 0。"""
+    """完整率 = 非缺失必填单元数 / (行数 * 必填字段数)。空批次记 0。
+
+    契约没有必填字段（所有字段均可选）时，完整性不存在"缺失"的可能，
+    取值依据明确记为 1.0（无必填单元需要满足，定义上 vacuously complete），
+    而不是报错或硬凑 0；reason 中写明取值依据。
+    """
 
     if not required_fields:
-        raise DependencyFailureError(
-            "完整性指标缺少必填字段定义",
-            contract=contract,
-            batch=batch_id,
-            reason="completeness_no_fields",
+        return _snapshot(
+            MetricType.COMPLETENESS,
+            batch_id,
+            contract,
+            1.0,
+            threshold,
+            evaluated_at,
+            "契约无必填字段，完整性按 1.0 计（无必填单元可缺失）",
         )
     total = len(rows) * len(required_fields)
     present = 0
@@ -137,6 +151,7 @@ def uniqueness(
         threshold,
         evaluated_at,
         f"{distinct}/{total} 键唯一",
+        dimension=key_field,
     )
 
 

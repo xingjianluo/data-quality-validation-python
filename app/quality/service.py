@@ -1,13 +1,15 @@
-"""门面服务：契约注册、校验提交（幂等）、指标判定与回溯。
+"""门面服务：契约注册、校验提交（幂等）、指标判定、基线漂移与回溯。
 
 并发/重复提交语义：
 
 * 以 ``(contract, batch_id)`` 为幂等键；
-* 同一批次首次提交真正执行校验并累计一次指标；
+* 同一批次首次提交真正执行校验并累计一次指标、判定一次漂移；
 * 并发线程通过 per-batch 锁 + double-check 串行化，后来者直接拿到
-  首次结论，绝不重复累计指标；
-* 阈值在"批次首次判定时"读取并固化进快照，之后注册同名契约的新阈值
-  不会回写历史批次。
+  首次结论，绝不重复累计指标、重复判定漂移；
+* 阈值 / 漂移容忍幅度在"批次首次判定时"读取并固化进快照与结论，之后
+  注册同名契约的新版本不会回写历史批次；
+* 基线选择在契约级判定锁内完成，保证"最近一次已判定批次"这一基线
+  对并发的不同批次也是确定、不重样的。
 """
 
 from __future__ import annotations
@@ -17,9 +19,13 @@ from threading import Lock
 from typing import Any
 
 from app.quality.contracts import Contract, normalize_contract
+from app.quality.drift import (
+    BaselineMode,
+    DriftVerdict,
+    evaluate_drift,
+)
 from app.quality.engine import ValidationEngine, ValidationResult
 from app.quality.errors import (
-    ContractInvalidError,
     FieldNotDeclaredError,
     MetricNotFoundError,
 )
@@ -28,7 +34,7 @@ from app.quality.storage import HistoryStore
 
 
 class QualityService:
-    """编排契约校验 + 指标历史的应用服务。"""
+    """编排契约校验 + 指标历史 + 基线漂移的应用服务。"""
 
     def __init__(self, engine: ValidationEngine | None = None) -> None:
         self._contracts: dict[str, Contract] = {}
@@ -38,6 +44,10 @@ class QualityService:
         self._register_lock = Lock()
         self._batch_locks: dict[tuple[str, str], Lock] = {}
         self._batch_locks_guard = Lock()
+        # 契约级判定锁：串行化基线解析 + 首次落库（锁序固定为
+        # 批次锁 -> 契约判定锁，不会反向获取，故无死锁）。
+        self._judge_locks: dict[str, Lock] = {}
+        self._judge_locks_guard = Lock()
 
     def register_contract(self, raw: dict[str, Any]) -> Contract:
         """归一化并注册契约；非法契约直接以可区分错误拒绝。"""
@@ -66,6 +76,14 @@ class QualityService:
                 self._batch_locks[key] = lock
             return lock
 
+    def _get_judge_lock(self, contract: str) -> Lock:
+        with self._judge_locks_guard:
+            lock = self._judge_locks.get(contract)
+            if lock is None:
+                lock = Lock()
+                self._judge_locks[contract] = lock
+            return lock
+
     def submit(
         self,
         contract_name: str,
@@ -73,8 +91,15 @@ class QualityService:
         rows: list[dict[str, Any]],
         *,
         now: datetime | None = None,
+        baseline_batch_id: str | None = None,
     ) -> ValidationResult:
-        """幂等提交：重复/并发批次返回首次结论，且不重复累计指标。"""
+        """幂等提交：重复/并发批次返回首次结论，且不重复累计/判定。
+
+        ``baseline_batch_id`` 显式指定漂移基线；不传则以判定顺序上最近的
+        已判定批次为基线。漂移结论只在批次首次判定时计算并固化。
+        显式基线不存在 / 尚未判定 / 指向当前批次时，以可区分原因拒绝，
+        不会硬凑结论（且不产生任何落库，调用方可改正后重试同一批次）。
+        """
 
         contract = self._get_contract(contract_name)
         evaluated_now = now or self._utcnow()
@@ -92,16 +117,79 @@ class QualityService:
                 return existing
 
             result = self._engine.validate(contract, rows, batch_id)
-            # 结果与指标在同一临界区内落库；指标只在首次写入时累计。
-            stored = self._store.save_result_if_absent(
-                contract_name, batch_id, result
-            )
-            if stored:
-                self._store.append_metrics_if_absent(
-                    contract_name, batch_id,
-                    self._evaluate(contract, batch_id, rows, evaluated_now),
+            snapshots = self._evaluate(contract, batch_id, rows, evaluated_now)
+
+            verdict: DriftVerdict | None = None
+            # 基线解析 + 漂移判定 + 落库在契约级锁内串行：
+            # 不同批次的"最近基线"互不抢占、确定有序。
+            judge_lock = self._get_judge_lock(contract_name)
+            with judge_lock:
+                # triple-check：进入契约锁前，当前批次可能已被同批次的
+                # 其它线程提交完成。
+                if self._store.has_batch(contract_name, batch_id):
+                    return self._store.get_result(contract_name, batch_id)  # type: ignore[return-value]
+
+                baseline_id, mode = self._resolve_baseline(
+                    contract_name, batch_id, baseline_batch_id
+                )
+                if baseline_id is not None:
+                    baseline_snaps = self._store.get_metrics(
+                        contract_name, baseline_id
+                    )
+                    verdict = evaluate_drift(
+                        contract=contract_name,
+                        batch_id=batch_id,
+                        current=snapshots,
+                        baseline_batch_id=baseline_id,
+                        baseline=baseline_snaps,
+                        tolerance=contract.drift_tolerance,
+                        mode=mode,
+                        evaluated_at=evaluated_now,
+                    )
+
+                # 结果、指标、漂移结论原子落库；并发下只有首个成功。
+                self._store.commit_if_absent(
+                    contract_name, batch_id, result, snapshots, verdict
                 )
             return result
+
+    def _resolve_baseline(
+        self,
+        contract_name: str,
+        batch_id: str,
+        explicit: str | None,
+    ) -> tuple[str | None, BaselineMode]:
+        """确定基线批次。
+
+        * 显式指定：批次必须存在且已判定，且不能是当前批次，否则拒绝；
+        * 未指定：取判定顺序上最近的前一个批次，没有则返回 None
+          （首个批次无基线，漂移结论缺省，不硬凑）。
+        """
+
+        if explicit is not None:
+            if explicit == batch_id:
+                raise MetricNotFoundError(
+                    f"契约 {contract_name} 的批次 {batch_id} 不能以自身为漂移基线",
+                    contract=contract_name,
+                    batch=batch_id,
+                    reason="baseline_is_current_batch",
+                )
+            if not self._store.has_batch(contract_name, explicit):
+                # 不区分"从未提交"与"提交了但还没判定完"，对调用方都是
+                # 同一个明确拒绝原因：基线不可用。
+                raise MetricNotFoundError(
+                    f"指定的基线批次 {explicit} 不存在或尚未判定，"
+                    f"无法为批次 {batch_id} 判定漂移",
+                    contract=contract_name,
+                    batch=explicit,
+                    reason="baseline_batch_not_judged",
+                )
+            return explicit, BaselineMode.EXPLICIT
+
+        latest = self._store.previous_batch(contract_name, batch_id)
+        if latest is None:
+            return None, BaselineMode.LATEST
+        return latest, BaselineMode.LATEST
 
     def _evaluate(
         self,
@@ -166,6 +254,7 @@ class QualityService:
                 reason="batch_not_found",
             )
         snapshots = self._store.get_metrics(contract_name, batch_id)
+        verdict = self._store.get_verdict(contract_name, batch_id)
         return {
             "contract": contract_name,
             "batch_id": batch_id,
@@ -176,6 +265,8 @@ class QualityService:
                 "violations": [v.model_dump() for v in result.violations],
             },
             "metrics": [s.trace() for s in snapshots],
+            # 新增信息仅追加：首个批次（无基线）时为 None，不改变老字段含义。
+            "drift": verdict.trace() if verdict is not None else None,
         }
 
     def history(self, contract_name: str) -> list[MetricSnapshot]:

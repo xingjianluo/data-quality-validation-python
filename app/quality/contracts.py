@@ -50,9 +50,41 @@ _PY_TYPES: dict[DataType, tuple[type, ...]] = {
 _TEMPORAL = (DataType.DATE, DataType.TIMESTAMP)
 _NUMERIC = (DataType.INTEGER, DataType.NUMBER)
 
+# 契约级 / 字段级允许出现的配置项白名单。注册严格模式：出现白名单外的
+# 键（含拼写错误，如 frehsness_field / uniqe）一律按契约非法拒绝。
+_CONTRACT_KEYS = frozenset(
+    {
+        "name",
+        "version",
+        "fields",
+        "freshness_field",
+        "freshness_max_age_seconds",
+        "drift_tolerance",
+    }
+)
+_FIELD_KEYS = frozenset(
+    {
+        "name",
+        "type",
+        "required",
+        "nullable",
+        "min_value",
+        "max_value",
+        "allowed",
+        "min_length",
+        "max_length",
+        "unique",
+        "regex",
+    }
+)
+# 漂移容忍幅度可配置的指标名。
+_DRIFT_METRIC_KEYS = frozenset({"completeness", "uniqueness", "freshness"})
+
 
 class FieldSpec(BaseModel):
     """单字段的统一约束模型。"""
+
+    model_config = {"extra": "forbid"}
 
     name: str
     type: DataType
@@ -70,14 +102,16 @@ class FieldSpec(BaseModel):
 class Contract(BaseModel):
     """一份数据契约。"""
 
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
     name: str
     version: int = 1
     fields_: list[FieldSpec] = Field(default_factory=list, alias="fields")
     # 时间字段及其 SLA，供刷新时效指标使用。
     freshness_field: str | None = None
     freshness_max_age_seconds: float | None = None
-
-    model_config = {"populate_by_name": True}
+    # 每个指标相对基线允许的最大下滑幅度（[0,1]），在批次首次判定时固化。
+    drift_tolerance: dict[str, float] = Field(default_factory=dict)
 
     @property
     def fields(self) -> dict[str, FieldSpec]:
@@ -106,10 +140,30 @@ def normalize_contract(raw: dict[str, Any]) -> Contract:
             "契约必须是 JSON 对象", reason="contract_not_object"
         )
 
+    unknown_contract_keys = sorted(set(raw) - _CONTRACT_KEYS)
+    if unknown_contract_keys:
+        # 严格注册：不认识的契约级配置项（含拼写错误）必须显式拒绝，
+        # 不能被当成"没写"悄悄放过。
+        raise ContractInvalidError(
+            f"契约 {raw.get('name')!r} 含不认识的契约级配置项 "
+            f"{unknown_contract_keys[0]}（位置：契约顶层）",
+            contract=raw.get("name") if isinstance(raw.get("name"), str) else None,
+            field=unknown_contract_keys[0],
+            reason="unknown_contract_key",
+        )
+
     name = raw.get("name")
     if not isinstance(name, str) or not name.strip():
         raise ContractInvalidError(
             "契约 name 不能为空字符串", reason="contract_name_blank"
+        )
+
+    version = raw.get("version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ContractInvalidError(
+            f"契约 {name} 的 version 必须是 >=1 的整数，实际为 {version!r}",
+            contract=name,
+            reason="contract_version_invalid",
         )
 
     raw_fields = raw.get("fields")
@@ -135,6 +189,18 @@ def normalize_contract(raw: dict[str, Any]) -> Contract:
                 f"契约 {name} 的第 {index} 个字段缺少有效 name",
                 contract=name,
                 reason="field_name_blank",
+            )
+        unknown_field_keys = sorted(set(rf) - _FIELD_KEYS)
+        if unknown_field_keys:
+            # 严格注册：字段级不认识的配置项（如 uniqe / nulable）显式拒绝，
+            # field 记录不认识的键名，消息定位到"哪个契约的哪个字段(索引)"。
+            bad_key = unknown_field_keys[0]
+            raise ContractInvalidError(
+                f"契约 {name} 的字段 {fname} 含不认识的字段级配置项 "
+                f"{bad_key}（位置：fields[{index}].{bad_key}）",
+                contract=name,
+                field=bad_key,
+                reason="unknown_field_key",
             )
         if fname in seen:
             # 同名重复 = 对同一字段给出了两套互相冲突的定义。
@@ -208,12 +274,48 @@ def normalize_contract(raw: dict[str, Any]) -> Contract:
                 reason="freshness_field_missing",
             )
 
+    raw_tolerance = raw.get("drift_tolerance")
+    drift_tolerance: dict[str, float] = {}
+    if raw_tolerance is not None:
+        if not isinstance(raw_tolerance, dict):
+            raise ContractInvalidError(
+                "drift_tolerance 必须是以指标名为键的对象",
+                contract=name,
+                reason="drift_tolerance_not_object",
+            )
+        for metric_name, tol in raw_tolerance.items():
+            if metric_name not in _DRIFT_METRIC_KEYS:
+                raise ContractInvalidError(
+                    f"drift_tolerance 含不认识的指标名 {metric_name!r}，"
+                    f"允许值为 {sorted(_DRIFT_METRIC_KEYS)}",
+                    contract=name,
+                    field=metric_name,
+                    reason="unknown_drift_metric",
+                )
+            if isinstance(tol, bool) or not isinstance(tol, (int, float)):
+                raise ContractInvalidError(
+                    f"drift_tolerance.{metric_name} 必须是数值",
+                    contract=name,
+                    field=metric_name,
+                    reason="drift_tolerance_not_number",
+                )
+            if tol < 0 or tol > 1:
+                raise ContractInvalidError(
+                    f"drift_tolerance.{metric_name} 必须落在 [0, 1]，实际为 {tol}",
+                    contract=name,
+                    field=metric_name,
+                    reason="drift_tolerance_out_of_range",
+                )
+            drift_tolerance[metric_name] = float(tol)
+
     try:
         return Contract(
             name=name,
+            version=version,
             fields=specs,
             freshness_field=freshness_field,
             freshness_max_age_seconds=freshness_max,
+            drift_tolerance=drift_tolerance,
         )
     except ValidationError as exc:  # pragma: no cover - 兜底，理论不可达
         raise ContractInvalidError(
